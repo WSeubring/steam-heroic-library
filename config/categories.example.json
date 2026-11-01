@@ -1,0 +1,15 @@
+{
+  "RPG": ["The Witcher 3: Wild Hunt", "Baldur's Gate 3", "Disco Elysium - The Final Cut"],
+  "Strategy & Tactics": ["Sid Meier's Civilization VI", "Europa Universalis IV"],
+  "RTS": ["Age of Empires II: Definitive Edition"],
+  "Builders & Factory": ["Cities: Skylines", "Factorio", "Oxygen Not Included"],
+  "Simulation & Life": ["Stardew Valley", "Kerbal Space Program"],
+  "Roguelikes": ["Hades", "Slay the Spire", "The Binding of Isaac: Rebirth"],
+  "Shooters": ["Borderlands 3", "DOOM Eternal"],
+  "Action & Adventure": ["Control", "Hollow Knight"],
+  "Survival": ["Valheim", "Subnautica"],
+  "Puzzle & Platformer": ["Portal 2", "Celeste"],
+  "Story": ["What Remains of Edith Finch"],
+  "Arcade, Sports & Racing": ["Rocket League", "Forza Horizon 5"],
+  "Demos, Betas & Tools": []
+}

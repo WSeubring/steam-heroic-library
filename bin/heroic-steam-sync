@@ -1,0 +1,734 @@
+#!/usr/bin/env python3
+"""Sync every owned Epic and GOG game from Heroic into Steam as a non-Steam shortcut.
+
+Each shortcut runs heroic-steam-launch: installed games start through Heroic,
+uninstalled ones open Heroic's install prompt. Cover art comes from the stores'
+CDNs; uninstalled games get grey art. Games (Steam ones too) are grouped into
+Steam collections from ~/.config/heroic-steam-sync/categories.json, with Jev
+(TypeSafe AI) sorting anything not listed there when an API key is available.
+
+Usage:
+  heroic-steam-sync                 sync now (skips if Steam is running)
+  heroic-steam-sync --launch-steam  sort new games, sync, then start Steam
+                                    (desktop entry; never prompts for a key)
+  heroic-steam-sync --classify      sort new games with Jev, then sync
+                                    (key: $TYPESAFE_API_KEY, or rbw item $JEV_SECRET)
+
+Used by the Steam plugin:
+  heroic-steam-sync --list          JSON of every Heroic shortcut and its status
+  heroic-steam-sync --status APPID  JSON install status of one shortcut
+  heroic-steam-sync --install APPID install it: Epic downloads directly with
+                                    Heroic's legendary, GOG opens Heroic's prompt
+  heroic-steam-sync --stop APPID    pause a direct install (resumable)
+  heroic-steam-sync --remove APPID  cancel a direct install, delete its partial files
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+HOME = Path.home()
+HEROIC = HOME / ".config/heroic"
+STEAM_USERDATA = HOME / ".local/share/Steam/userdata"
+CACHE = HOME / ".cache/heroic-steam-sync"
+LAUNCH_EXE = f'"{HOME}/.local/bin/heroic-steam-launch"'
+# Collections this script owns; any of these not written by the current sync get deleted.
+MANAGED_COLLECTIONS = ("user-collections.uc-hss-", "user-collections.uc-heroicepic")
+CATEGORIES = HOME / ".config/heroic-steam-sync/categories.json"
+LEGENDARY = os.environ.get(
+    "HEROIC_LEGENDARY", "/opt/Heroic/resources/app.asar.unpacked/build/bin/x64/linux/legendary")
+INSTALLS = HOME / ".cache/heroic-steam-sync/installs"
+STEAM = HOME / ".local/share/Steam"
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_SECRET = os.environ.get("JEV_SECRET", "TypeSafe Jev API")
+OTHER = "Other"
+DEMOS = "Demos, Betas & Tools"
+# Label descriptions for Jev; categories added to categories.json work without one.
+CATEGORY_HINTS = {
+    "RPG": "Role-playing games, including action RPGs, CRPGs and MMORPGs",
+    "Strategy & Tactics": "Grand strategy, 4X, turn-based strategy or tactics, tower defense, card and board games",
+    "RTS": "Real-time strategy",
+    "Builders & Factory": "City builders, colony sims, base building, automation and factory games, park and zoo builders",
+    "Simulation & Life": "Simulators, management, farming and life sims, vehicle, flight and space sims",
+    "Roguelikes": "Roguelikes and roguelites, including survivors-likes and roguelike deckbuilders",
+    "Shooters": "First- and third-person shooters",
+    "Action & Adventure": "Action, action-adventure, horror, stealth, hack and slash, open-world action",
+    "Survival": "Survival and survival-crafting games",
+    "Puzzle & Platformer": "Puzzle games, platformers and metroidvanias",
+    "Story": "Narrative-first games: visual novels, point and click, walking sims, interactive drama",
+    "Arcade, Sports & Racing": "Racing, sports, fighting, party, arcade, shoot 'em ups, rhythm and casual games",
+    DEMOS: "Demos, playtests, betas, test servers, mod kits and non-game software",
+    OTHER: "Nothing above fits",
+}
+# runner: (label, library cache, list key, installed-games reader)
+STORES = {
+    "legendary": ("Epic", "store_cache/legendary_library.json", "library",
+                  lambda: set(json.loads((HEROIC / "legendaryConfig/legendary/installed.json").read_text()))),
+    "gog": ("GOG", "store_cache/gog_library.json", "games",
+            lambda: {g["appName"] for g in json.loads((HEROIC / "gog_store/installed.json").read_text())["installed"]}),
+}
+
+
+def log(msg):
+    print(f"heroic-steam-sync: {msg}", file=sys.stderr)
+
+
+# Binary VDF (shortcuts.vdf): 0x00 map, 0x01 string, 0x02 int32, 0x08 end.
+def read_cstr(data, i):
+    end = data.index(b"\x00", i)
+    return data[i:end].decode("utf-8", "replace"), end + 1
+
+
+def parse_map(data, i):
+    out = {}
+    while True:
+        t = data[i]
+        i += 1
+        if t == 0x08:
+            return out, i
+        key, i = read_cstr(data, i)
+        if t == 0x00:
+            out[key], i = parse_map(data, i)
+        elif t == 0x01:
+            out[key], i = read_cstr(data, i)
+        elif t == 0x02:
+            out[key] = struct.unpack_from("<i", data, i)[0]
+            i += 4
+        else:
+            raise ValueError(f"unknown vdf type {t:#x} at {i}")
+
+
+def dump_map(d):
+    out = b""
+    for key, val in d.items():
+        k = key.encode() + b"\x00"
+        if isinstance(val, dict):
+            out += b"\x00" + k + dump_map(val)
+        elif isinstance(val, int):
+            out += b"\x02" + k + struct.pack("<i", val)
+        else:
+            out += b"\x01" + k + str(val).encode() + b"\x00"
+    return out + b"\x08"
+
+
+def load_shortcuts(path):
+    if not path.exists():
+        return []
+    data = path.read_bytes()
+    root, _ = parse_map(data, 0)
+    return list(root.get("shortcuts", {}).values())
+
+
+def save_shortcuts(path, entries):
+    body = {str(i): e for i, e in enumerate(entries)}
+    tmp = path.with_suffix(".vdf.tmp")
+    tmp.write_bytes(dump_map({"shortcuts": body}))
+    tmp.replace(path)
+
+
+def is_managed(entry):
+    opts = entry.get("LaunchOptions", "") + entry.get("Exe", "")
+    return "heroic://" in opts or "heroic-steam-launch" in opts
+
+
+def shortcut_appid(exe, name):
+    """Unsigned 32-bit id Steam uses for grid art file names."""
+    return (zlib.crc32((exe + name).encode()) & 0xFFFFFFFF) | 0x80000000
+
+
+def make_entry(game, name, icon):
+    appid = shortcut_appid(LAUNCH_EXE, name)
+    entry = {
+        "appid": struct.unpack("<i", struct.pack("<I", appid))[0],
+        "AppName": name,
+        "Exe": LAUNCH_EXE,
+        "StartDir": f'"{HOME}"',
+        "icon": str(icon),
+        "ShortcutPath": "",
+        "LaunchOptions": f"{game['runner']} {game['app_name']} {shlex.quote(name)}",
+        "IsHidden": 0,
+        "AllowDesktopConfig": 1,
+        "AllowOverlay": 1,
+        "openvr": 0,
+        "Devkit": 0,
+        "DevkitGameID": "",
+        "DevkitOverrideAppID": 0,
+        "LastPlayTime": 0,
+        "FlatpakAppID": "",
+        "tags": {"0": STORES[game["runner"]][0]},
+    }
+    return entry, appid
+
+
+def fetch(url, dest):
+    if dest.exists() or not url:
+        return dest.exists()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        req = urllib.request.Request(urllib.parse.quote(url, safe=":/?&=%"), headers={"User-Agent": "heroic-steam-sync"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            dest.write_bytes(r.read())
+        return True
+    except Exception as e:
+        log(f"art download failed for {dest}: {e}")
+        return False
+
+
+def place(src, dest, grey):
+    """Copy art into Steam's grid folder, desaturated and dimmed if not installed."""
+    if grey:
+        subprocess.run(["magick", str(src), "-colorspace", "Gray", "-modulate", "70",
+                        "-quality", "85", str(dest)], check=True)
+    else:
+        shutil.copyfile(src, dest)
+
+
+def sync_art(grid, appid, game, installed, state):
+    """Cache the store's original art, then write color or grey copies to the grid."""
+    grid.mkdir(parents=True, exist_ok=True)
+    cache = CACHE / game["app_name"]
+    tall, wide = game.get("art_square"), game.get("art_cover")
+    have_tall = fetch(tall or wide, cache / "tall.jpg")
+    have_wide = fetch(wide or tall, cache / "wide.jpg")
+    if game.get("art_logo"):
+        fetch(game["art_logo"], grid / f"{appid}_logo.png")
+    targets = []
+    if have_tall:
+        targets.append((cache / "tall.jpg", grid / f"{appid}p.jpg"))
+    if have_wide:
+        targets += [(cache / "wide.jpg", grid / f"{appid}.jpg"),
+                    (cache / "wide.jpg", grid / f"{appid}_hero.jpg")]
+    key = str(appid)
+    stale = state.get(key) != installed
+    for src, dest in targets:
+        if stale or not dest.exists():
+            place(src, dest, grey=not installed)
+    icon = grid / f"{appid}_icon.png"
+    if (have_tall or have_wide) and (stale or not icon.exists()):
+        src = cache / ("tall.jpg" if have_tall else "wide.jpg")
+        cmd = ["magick", str(src), "-resize", "256x256^", "-gravity", "center", "-extent", "256x256"]
+        if not installed:
+            cmd += ["-colorspace", "Gray", "-modulate", "70"]
+        subprocess.run(cmd + [str(icon)], check=True)
+    state[key] = installed
+    return icon if icon.exists() else ""
+
+
+def sync_collections(user, groups):
+    """Write Steam user collections (stored in Steam's cloud namespace 1)."""
+    store = user / "config/cloudstorage"
+    data_path = store / "cloud-storage-namespace-1.json"
+    modified_path = store / "cloud-storage-namespace-1.modified.json"
+    if not data_path.exists():
+        log("no Steam collections store yet; start Steam once, then sync again.")
+        return
+    data = json.loads(data_path.read_text())
+    versions = dict(json.loads((store / "cloud-storage-namespaces.json").read_text()))
+    version = versions.get(1, "0")
+    modified = json.loads(modified_path.read_text()) if modified_path.exists() else []
+    now = int(time.time())
+    current = {f"user-collections.{cid}" for cid, _, _ in groups}
+    for e in data:
+        if (e[0].startswith(MANAGED_COLLECTIONS) and e[0] not in current
+                and not e[1].get("is_deleted")):
+            e[1] = {"key": e[0], "timestamp": now, "is_deleted": True, "version": version}
+            if e[0] not in modified:
+                modified.append(e[0])
+    for cid, name, appids in groups:
+        key = f"user-collections.{cid}"
+        value = json.dumps({"id": cid, "name": name, "added": sorted(appids), "removed": []},
+                           separators=(",", ":"))
+        existing = next((e for e in data if e[0] == key), None)
+        if existing and json.loads(existing[1].get("value", "{}")).get("added") == sorted(appids):
+            continue
+        entry = {"key": key, "timestamp": now, "value": value, "version": version}
+        if existing:
+            existing[1] = entry
+        else:
+            data.append([key, entry])
+        if key not in modified:
+            modified.append(key)
+    data_path.write_text(json.dumps(data, separators=(",", ":")))
+    modified_path.write_text(json.dumps(modified))
+
+
+def norm(title):
+    return re.sub(r"[^a-z0-9]", "", title.lower())
+
+
+def parse_appinfo(path):
+    """Steam's appcache/appinfo.vdf (v28/v29) as {appid: appinfo dict}."""
+    d = path.read_bytes()
+    magic, = struct.unpack_from("<I", d, 0)
+    i, strings = 8, None
+    if magic == 0x07564429:
+        off, = struct.unpack_from("<q", d, 8)
+        i = 16
+        count, = struct.unpack_from("<I", d, off)
+        j, strings = off + 4, []
+        for _ in range(count):
+            s_end = d.index(b"\x00", j)
+            strings.append(d[j:s_end].decode("utf-8", "replace"))
+            j = s_end + 1
+    elif magic != 0x07564428:
+        raise ValueError(f"unknown appinfo.vdf version {magic:#x}")
+
+    def key(i):
+        if strings is not None:
+            return strings[struct.unpack_from("<i", d, i)[0]], i + 4
+        return read_cstr(d, i)
+
+    def kv(i):
+        out = {}
+        while True:
+            t = d[i]
+            i += 1
+            if t in (0x08, 0x0B):
+                return out, i
+            k, i = key(i)
+            if t == 0x00:
+                out[k], i = kv(i)
+            elif t == 0x01:
+                out[k], i = read_cstr(d, i)
+            elif t in (0x02, 0x03, 0x04, 0x06):
+                out[k] = struct.unpack_from("<i", d, i)[0]
+                i += 4
+            elif t in (0x07, 0x0A):
+                out[k] = struct.unpack_from("<q", d, i)[0]
+                i += 8
+            else:
+                raise ValueError(f"unknown kv type {t:#x}")
+
+    apps = {}
+    while True:
+        appid, size = struct.unpack_from("<II", d, i)
+        if appid == 0:
+            break
+        try:
+            info, _ = kv(i + 68)
+            apps[appid] = info.get("appinfo", info)
+        except (ValueError, IndexError, struct.error):
+            pass
+        i += 8 + size
+    return apps
+
+
+def steam_tag_names():
+    path = CACHE / "steam_tags.json"
+    if not path.exists():
+        if not fetch("https://store.steampowered.com/tagdata/populartags/english", path):
+            return {}
+    return {t["tagid"]: t["name"] for t in json.loads(path.read_text())}
+
+
+def steam_library():
+    """Games and demos in the Steam library (from Steam's local app cache)."""
+    apps = parse_appinfo(STEAM / "appcache/appinfo.vdf")
+    tag_names = steam_tag_names()
+    owned = [int(p.name) for p in (STEAM / "appcache/librarycache").iterdir() if p.name.isdigit()]
+    games = []
+    for appid in owned:
+        common = (apps.get(appid) or {}).get("common") or {}
+        kind = str(common.get("type", "")).lower()
+        if kind not in ("game", "demo", "beta") or not common.get("name"):
+            continue
+        tags = [tag_names.get(int(t), "") for t in (common.get("store_tags") or {}).values()]
+        games.append({"key": f"steam:{appid}", "title": common["name"], "store": "Steam",
+                      "kind": kind, "tags": [t for t in tags if t][:10], "appid": appid})
+    return games
+
+
+def load_cache(name):
+    path = CACHE / name
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_cache(name, data):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    (CACHE / name).write_text(json.dumps(data, indent=1, ensure_ascii=False))
+
+
+def explicit_categories():
+    """{normalized title: category} from categories.json."""
+    if not CATEGORIES.exists():
+        return {}, []
+    cats = json.loads(CATEGORIES.read_text())
+    return {norm(t): name for name, titles in cats.items() for t in titles}, list(cats)
+
+
+def category_groups(items):
+    """Collections: categories.json first, then cached Jev results."""
+    explicit, names = explicit_categories()
+    jev = load_cache("jev.json")
+    groups = {name: [] for name in [*names, OTHER]}
+    for item in items:
+        cat = explicit.get(norm(item["title"])) or (jev.get(item["key"]) or {}).get("category")
+        if cat:
+            groups.setdefault(cat, []).append(item["appid"])
+    return [(f"uc-hss-{norm(name)[:20]}", name, list(dict.fromkeys(ids)))
+            for name, ids in groups.items() if ids]
+
+
+def jev_classify(item, labels, api_key, timeout=30, attempts=5):
+    state = f"{item['store']} game: {item['title']}."
+    if item.get("tags"):
+        state += f" Steam store tags: {', '.join(item['tags'])}."
+    body = {"model": "jev-latest", "state": state, "questions": {"collection": {
+        "type": "choice",
+        "instructions": "Which game-library collection does this game belong in",
+        "criteria": labels}}}
+    for attempt in range(attempts):
+        req = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
+            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                answer = json.loads(r.read())["answers"]["collection"]
+            return {"category": answer["choice"], "confidence": answer["confidence"]}
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 529, 500, 502, 503):
+                raise
+            time.sleep(float(e.headers.get("retry-after") or 2 ** attempt))
+    raise RuntimeError(f"Jev kept failing for {item['title']}")
+
+
+def jev_api_key(quick):
+    """$TYPESAFE_API_KEY, else the Bitwarden item $JEV_SECRET via rbw, else None.
+
+    quick: never trigger rbw's password prompt; a locked vault means no key this time.
+    """
+    if os.environ.get("TYPESAFE_API_KEY"):
+        return os.environ["TYPESAFE_API_KEY"]
+    if not shutil.which("rbw"):
+        return None
+    if quick and subprocess.run(["rbw", "unlocked"], capture_output=True).returncode != 0:
+        return None
+    out = subprocess.run(["rbw", "get", JEV_SECRET], capture_output=True, text=True)
+    return out.stdout.strip() or None
+
+
+def classify(items, quick=False):
+    """Ask Jev for every game not in categories.json and not cached yet.
+
+    quick (Steam startup): skip when the vault is locked instead of prompting,
+    and use short timeouts so Steam is never held up for long.
+    """
+    explicit, names = explicit_categories()
+    cache = load_cache("jev.json")
+    todo = [i for i in items if norm(i["title"]) not in explicit and i["key"] not in cache]
+    if not todo:
+        log("classify: nothing new")
+        return
+    for item in [i for i in todo if i.get("kind") in ("demo", "beta")]:
+        cache[item["key"]] = {"category": DEMOS, "confidence": 1.0, "title": item["title"]}
+    todo = [i for i in todo if i["key"] not in cache]
+    if not todo:
+        save_cache("jev.json", cache)
+        return
+    api_key = jev_api_key(quick)
+    if not api_key:
+        save_cache("jev.json", cache)
+        log(f"classify: {len(todo)} new games left uncategorized (no Jev API key available)")
+        return
+    timeout, attempts = (8, 2) if quick else (30, 5)
+    labels = {n: CATEGORY_HINTS.get(n) for n in [*names, OTHER]}
+    log(f"classify: asking Jev about {len(todo)} games")
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(jev_classify, i, labels, api_key, timeout, attempts): i
+                   for i in todo}
+        for f in as_completed(futures):
+            item = futures[f]
+            try:
+                cache[item["key"]] = {**f.result(), "title": item["title"]}
+            except Exception as e:
+                log(f"classify failed for {item['title']}: {e}")
+    save_cache("jev.json", cache)
+    log(f"classify: {len(cache)} games cached")
+
+
+def steam_running():
+    return subprocess.run(["pgrep", "-x", "steam"], capture_output=True).returncode == 0
+
+
+def owned_games():
+    """Owned games from every logged-in Heroic store, with runner and install status."""
+    games = []
+    for runner, (label, cache, key, read_installed) in STORES.items():
+        path = HEROIC / cache
+        if not path.exists():
+            continue
+        try:
+            installed = read_installed()
+        except FileNotFoundError:
+            installed = set()
+        for g in json.loads(path.read_text())[key]:
+            if (g.get("install") or {}).get("is_dlc") or g["app_name"].endswith("-redist"):
+                continue
+            games.append({**g, "runner": runner, "installed": g["app_name"] in installed})
+    return sorted(games, key=lambda g: g["title"].lower())
+
+
+def steam_names(games):
+    """Steam shortcut names; a title owned in several stores gets a store suffix."""
+    first = {}
+    names = []
+    for g in games:
+        n = norm(g["title"])
+        first.setdefault(n, g["runner"])
+        dup = first[n] != g["runner"]
+        names.append(f"{g['title']} ({STORES[g['runner']][0]})" if dup else g["title"])
+    return names
+
+
+def heroic_items(games, names):
+    return [{"key": f"{g['runner']}:{g['app_name']}", "title": g["title"],
+             "store": STORES[g["runner"]][0], "appid": shortcut_appid(LAUNCH_EXE, n)}
+            for g, n in zip(games, names)]
+
+
+def sync(do_classify=False, quick=False):
+    if steam_running():
+        if do_classify and not quick:
+            games = owned_games()
+            classify(steam_library() + heroic_items(games, steam_names(games)), quick)
+        log("Steam is running; it would overwrite shortcuts on exit. Skipping.")
+        return
+    games = owned_games()
+    if not games:
+        log("no Heroic libraries found; open Heroic and log in to a store.")
+        return
+    names = steam_names(games)
+    if do_classify:
+        try:
+            classify(steam_library() + heroic_items(games, names), quick)
+        except Exception as e:
+            log(f"classify failed: {e}")
+    state_path = CACHE / "state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    for user in STEAM_USERDATA.iterdir():
+        if not user.name.isdigit() or user.name == "0":
+            continue
+        path = user / "config/shortcuts.vdf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kept = [e for e in load_shortcuts(path) if not is_managed(e)]
+        added, have, missing = [], [], []
+        for game, name in zip(games, names):
+            appid = shortcut_appid(LAUNCH_EXE, name)
+            icon = sync_art(user / "config/grid", appid, game, game["installed"],
+                            state.setdefault(user.name, {}))
+            entry, _ = make_entry(game, name, icon)
+            added.append(entry)
+            (have if game["installed"] else missing).append(appid)
+        save_shortcuts(path, kept + added)
+        sync_collections(user, category_groups(steam_library() + heroic_items(games, names)))
+        log(f"user {user.name}: {len(have)} installed, {len(missing)} not installed, "
+            f"{len(kept)} other shortcuts kept")
+    CACHE.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state))
+
+
+def find_game(appid):
+    """The Heroic game behind a Steam shortcut appid (signed or unsigned), or None."""
+    appid = int(appid) & 0xFFFFFFFF
+    games = owned_games()
+    for game, name in zip(games, steam_names(games)):
+        if shortcut_appid(LAUNCH_EXE, name) == appid:
+            return game, name
+    return None
+
+
+def status(appid):
+    """JSON for the Steam plugin: is this shortcut a Heroic game, and is it installed?"""
+    found = find_game(appid)
+    if not found:
+        return {"managed": False}
+    game, name = found
+    return {"managed": True, "installed": game["installed"], "title": name,
+            "store": STORES[game["runner"]][0]}
+
+
+def install_percent(log):
+    """Overall progress: bytes on disk / full install size.
+
+    legendary's own "Progress: n%" restarts from 0 after a resume (it only counts the
+    remaining files), so it is used only until the install folder exists.
+    """
+    data = log.read_bytes()
+    head = data[:50000].decode(errors="replace")
+    path = re.search(r"Install path: (.+)", head)
+    size = re.search(r"Install size: ([\d.]+) MiB", head)
+    if path and size and Path(path.group(1).strip()).is_dir():
+        out = subprocess.run(["du", "-sb", path.group(1).strip()], capture_output=True, text=True)
+        if out.returncode == 0:
+            done = int(out.stdout.split()[0])
+            return min(99.9, round(done / (float(size.group(1)) * 1024 * 1024) * 100, 1))
+    percents = re.findall(r"Progress: ([\d.]+)%", data[-20000:].decode(errors="replace"))
+    return float(percents[-1]) if percents else 0.0
+
+
+def install_state(game):
+    """Progress of a direct Epic install started by install(), or None."""
+    if game["runner"] != "legendary" or game["installed"]:
+        return None
+    log, pid = INSTALLS / f"{game['app_name']}.log", INSTALLS / f"{game['app_name']}.pid"
+    if not log.exists():
+        return None
+    percent = install_percent(log)
+    try:
+        running = "legendary" in Path(f"/proc/{int(pid.read_text())}/cmdline").read_text(errors="replace")
+    except (OSError, ValueError):
+        running = False
+    if (INSTALLS / f"{game['app_name']}.stopped").exists():
+        return {"state": "stopping" if running else "stopped", "percent": round(percent, 1)}
+    if running:
+        return {"state": "downloading", "percent": round(percent, 1)}
+    return {"state": "failed", "log": str(log)}
+
+
+def list_games(_=None):
+    """Every Heroic shortcut for the Steam plugin: {appid: {title, store, installed, install}}."""
+    games = owned_games()
+    return {str(shortcut_appid(LAUNCH_EXE, name)): {
+                "title": name, "store": STORES[g["runner"]][0], "installed": g["installed"],
+                "install": install_state(g)}
+            for g, name in zip(games, steam_names(games))}
+
+
+def install(appid):
+    """Install the game behind a Steam shortcut.
+
+    Epic: download directly with Heroic's bundled legendary and Heroic's config, so
+    Heroic sees the game as installed afterwards. GOG: Heroic only registers GOG
+    installs it ran itself, so open Heroic's install prompt instead.
+    """
+    found = find_game(appid)
+    if not found:
+        return {"ok": False, "error": "not a Heroic game"}
+    game, name = found
+    quiet = {"start_new_session": True, "stdin": subprocess.DEVNULL}
+    if game["runner"] != "legendary":
+        subprocess.Popen([LAUNCH_EXE.strip('"'), game["runner"], game["app_name"], name],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **quiet)
+        return {"ok": True, "mode": "heroic"}
+    state = (install_state(game) or {}).get("state")
+    if state == "downloading":
+        return {"ok": True, "mode": "direct", "already": True}
+    if state == "stopping":
+        return {"ok": False, "error": "still stopping, try again in a few seconds"}
+    INSTALLS.mkdir(parents=True, exist_ok=True)
+    (INSTALLS / f"{game['app_name']}.stopped").unlink(missing_ok=True)
+    log = INSTALLS / f"{game['app_name']}.log"
+    script = (
+        'LEGENDARY_CONFIG_PATH="$HOME/.config/heroic/legendaryConfig/legendary" '
+        '"$1" -y install "$2" --base-path "$3" --platform Windows --skip-sdl --skip-dlcs '
+        '&& notify-send -a Heroic "Installed: $4" "Ready to play from Steam." '
+        '|| [ -e "$6" ] || notify-send -u critical -a Heroic "Install failed: $4" "Log: $5"'
+    )
+    base = json.loads((HEROIC / "config.json").read_text())["defaultSettings"].get(
+        "defaultInstallPath", str(HOME / "Games/Heroic"))
+    with open(log, "w") as out:
+        proc = subprocess.Popen(["bash", "-c", script, "legendary-install", LEGENDARY,
+                                 game["app_name"], base, name, str(log),
+                                 str(INSTALLS / f"{game['app_name']}.stopped")],
+                                stdout=out, stderr=subprocess.STDOUT, **quiet)
+    (INSTALLS / f"{game['app_name']}.pid").write_text(str(proc.pid))
+    subprocess.Popen(["notify-send", "-a", "Heroic", f"Installing: {name}",
+                      f"Downloading to {base}. Progress shows in Steam."], **quiet)
+    return {"ok": True, "mode": "direct"}
+
+
+def stop(appid):
+    """Stop a direct Epic install; legendary resumes it on the next install()."""
+    found = find_game(appid)
+    if not found:
+        return {"ok": False, "error": "not a Heroic game"}
+    game, _ = found
+    if (install_state(game) or {}).get("state") != "downloading":
+        return {"ok": False, "error": "not downloading"}
+    pid = int((INSTALLS / f"{game['app_name']}.pid").read_text())
+    (INSTALLS / f"{game['app_name']}.stopped").touch()
+    # The install runs in its own session (process group = pid): ask bash and legendary
+    # to stop, then force it if legendary is still shutting down after 5 seconds.
+    os.killpg(pid, signal.SIGTERM)
+    subprocess.Popen(["sh", "-c", f"sleep 5; kill -KILL -- -{pid} 2>/dev/null"],
+                     start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"ok": True}
+
+
+def remove(appid):
+    """Cancel a direct Epic install: stop it if running, delete its partial files.
+
+    Deletes only the install folder legendary logged for this game, and only when it
+    sits inside Heroic's install folder and the game is not installed.
+    """
+    found = find_game(appid)
+    if not found:
+        return {"ok": False, "error": "not a Heroic game"}
+    game, _ = found
+    app = game["app_name"]
+    if game["runner"] != "legendary" or game["installed"]:
+        return {"ok": False, "error": "nothing to remove"}
+    log, pid_file = INSTALLS / f"{app}.log", INSTALLS / f"{app}.pid"
+    if not log.exists():
+        return {"ok": False, "error": "no install started from Steam"}
+    (INSTALLS / f"{app}.stopped").touch()  # silences the "install failed" notification
+    try:
+        pid = int(pid_file.read_text())
+        os.killpg(pid, signal.SIGTERM)
+        for _ in range(12):
+            time.sleep(0.5)
+            os.killpg(pid, 0)
+        os.killpg(pid, signal.SIGKILL)
+        time.sleep(0.5)
+    except (OSError, ValueError):
+        pass  # not running (anymore)
+    base = Path(json.loads((HEROIC / "config.json").read_text())["defaultSettings"].get(
+        "defaultInstallPath", str(HOME / "Games/Heroic"))).resolve()
+    path = re.search(r"Install path: (.+)", log.read_bytes()[:50000].decode(errors="replace"))
+    removed = None
+    if path:
+        target = Path(path.group(1).strip()).resolve()
+        if target.parent == base and target.is_dir():
+            shutil.rmtree(target)
+            removed = str(target)
+    (HEROIC / f"legendaryConfig/legendary/tmp/{app}.resume").unlink(missing_ok=True)
+    for suffix in ("log", "pid", "stopped"):
+        (INSTALLS / f"{app}.{suffix}").unlink(missing_ok=True)
+    return {"ok": True, "removed": removed}
+
+
+def main():
+    if "--list" in sys.argv:
+        print(json.dumps(list_games()))
+        return
+    for flag, action in (("--status", status), ("--install", install), ("--stop", stop),
+                         ("--remove", remove)):
+        if flag in sys.argv:
+            print(json.dumps(action(sys.argv[sys.argv.index(flag) + 1])))
+            return
+    try:
+        launching = "--launch-steam" in sys.argv
+        sync(do_classify=launching or "--classify" in sys.argv, quick=launching)
+    except Exception as e:
+        log(f"sync failed: {e}")
+        if "--launch-steam" not in sys.argv:
+            raise
+    if "--launch-steam" in sys.argv:
+        args = [a for a in sys.argv[1:] if a != "--launch-steam"]
+        os.execv("/usr/bin/steam", ["/usr/bin/steam", *args])
+
+
+if __name__ == "__main__":
+    main()
