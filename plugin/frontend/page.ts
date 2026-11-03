@@ -30,14 +30,24 @@ export function pageScript() {
 			return found;
 		}
 
+		// Desktop Steam draws its library in 'SP Desktop_uid0'; Game Mode (Big Picture) in
+		// 'SP BPM_uid0', where buttons must stay focusable for the controller.
+		function mainWindow() {
+			const popups = [...(window.g_PopupManager?.m_mapPopups?.values() ?? [])];
+			const desktop = popups.find((p) => p.m_strName === 'SP Desktop_uid0');
+			const bpm = popups.find((p) => p.m_strName === 'SP BPM_uid0');
+			const popup = desktop ?? bpm;
+			return { doc: popup?.m_popup?.document, gamepad: !desktop && !!bpm };
+		}
+
 		function mainDoc() {
-			const popup = [...(window.g_PopupManager?.m_mapPopups?.values() ?? [])]
-				.find((p) => p.m_strName === 'SP Desktop_uid0');
-			return popup?.m_popup?.document;
+			return mainWindow().doc;
 		}
 
 		function openAppId() {
-			const path = window.MainWindowBrowserManager?.m_lastLocation?.pathname ?? '';
+			const path = window.MainWindowBrowserManager?.m_lastLocation?.pathname
+				?? window.SteamUIStore?.WindowStore?.GamepadUIMainWindowInstance?.m_history?.location?.pathname
+				?? '';
 			const m = /\/library\/app\/(\d+)/.exec(path);
 			return m ? m[1] : null;
 		}
@@ -80,32 +90,81 @@ export function pageScript() {
 				controls.append(el);
 				return el;
 			};
-			control('⏸', 'Pause install (resume later)', () => {
-				clicks.push({ appid, action: 'stop' });
-				button.dataset.pending = String(Date.now());
-			});
-			control('✕', 'Remove install (deletes downloaded files)', () => {
-				if (Date.now() - Number(button.dataset.confirm || 0) < 4000) {
-					delete button.dataset.confirm;
-					clicks.push({ appid, action: 'remove' });
-					button.dataset.pending = String(Date.now());
-					button.dataset.removing = '1';
-				} else {
-					button.dataset.confirm = String(Date.now());
-					setTimeout(() => renderButton(button, games[appid]), 4100);
-				}
-			});
+			control('⏸', 'Pause install (resume later)', () => pause(button));
+			control('✕', 'Remove install (deletes downloaded files)', () => remove(button));
 			button.append(label, detail, controls);
-			button.addEventListener('click', () => {
-				const state = games[appid]?.install?.state;
-				const confirming = Date.now() - Number(button.dataset.confirm || 0) < 4000;
-				if (state === 'downloading' || button.dataset.pending || button.dataset.removing || confirming) return;
-				clicks.push({ appid, action: 'install' });
-				button.dataset.pending = String(Date.now());
-				renderButton(button, games[appid]);
-			});
+			button.addEventListener('click', () => install(button));
 			renderButton(button, games[appid]);
 			return button;
+		}
+
+		// Game Mode: an overlay inside Steam's own Play button, which keeps the controller
+		// focus. Its A press (vgp_onok) and X press are caught in onGamepadButton().
+		function makeOverlay(doc, appid) {
+			const overlay = makeButton(doc, appid, { dataset: {} });
+			overlay.dataset.gamepad = '1';
+			Object.assign(overlay.style, {
+				position: 'absolute', inset: '0', minWidth: '0', height: 'auto', zIndex: '1',
+				pointerEvents: 'none', borderRadius: 'inherit',
+			});
+			return overlay;
+		}
+
+		function install(button) {
+			const appid = button.dataset.appid;
+			const state = games[appid]?.install?.state;
+			const confirming = Date.now() - Number(button.dataset.confirm || 0) < 4000;
+			if (state === 'downloading' || button.dataset.pending || button.dataset.removing || confirming) return;
+			clicks.push({ appid, action: 'install' });
+			button.dataset.pending = String(Date.now());
+			renderButton(button, games[appid]);
+		}
+
+		function pause(button) {
+			clicks.push({ appid: button.dataset.appid, action: 'stop' });
+			button.dataset.pending = String(Date.now());
+		}
+
+		function remove(button) {
+			if (Date.now() - Number(button.dataset.confirm || 0) < 4000) {
+				delete button.dataset.confirm;
+				clicks.push({ appid: button.dataset.appid, action: 'remove' });
+				button.dataset.pending = String(Date.now());
+				button.dataset.removing = '1';
+			} else {
+				button.dataset.confirm = String(Date.now());
+				setTimeout(() => renderButton(button, games[button.dataset.appid]), 4100);
+			}
+		}
+
+		// A (or a tap) on Play: install, pause a download, or resume. X: remove a started
+		// install, pressed twice like ✕ on the desktop. GOG keeps Steam's own Play: gamescope
+		// shows only windows of apps Steam launched, so Heroic's prompt must start that way.
+		const GAMEPAD_OK = 1, GAMEPAD_X = 3;
+		function onGamepadButton(event) {
+			const container = classes?.play.PlayButtonContainer.split(' ')[0];
+			const overlay = container && event.target?.closest?.(`.${container}`)?.querySelector(`:scope > .${BUTTON_CLASS}`);
+			if (!overlay) return;
+			if (games[overlay.dataset.appid]?.store !== 'Epic') return;
+			const state = games[overlay.dataset.appid]?.install?.state;
+			const x = event.type === 'vgp_onbuttondown' && event.detail?.button === GAMEPAD_X;
+			if (event.type === 'vgp_onbuttondown' && !x) return;
+			if (x && state !== 'downloading' && state !== 'stopped') return;
+			event.stopImmediatePropagation();
+			event.preventDefault();
+			if (x) remove(overlay);
+			else if (state === 'downloading' && !overlay.dataset.pending) pause(overlay);
+			else install(overlay);
+			renderButton(overlay, games[overlay.dataset.appid]);
+		}
+
+		const hookedDocs = new WeakSet();
+		function hookGamepad(doc) {
+			if (hookedDocs.has(doc)) return;
+			hookedDocs.add(doc);
+			for (const type of ['vgp_onok', 'vgp_onbuttondown', 'click']) {
+				doc.addEventListener(type, onGamepadButton, true);
+			}
 		}
 
 		// INSTALL, STARTING…/STOPPING… (clicked, waiting for the backend), INSTALLING n% with
@@ -127,11 +186,12 @@ export function pageScript() {
 				delete button.dataset.pending;
 			}
 			const confirming = Date.now() - Number(button.dataset.confirm || 0) < 4000;
+			const gamepad = !!button.dataset.gamepad;
 			let text, sub, fill, clickable;
 			if (button.dataset.removing) {
 				text = 'REMOVING…'; sub = `Deleting files · ${game.store}`; fill = null; clickable = false;
 			} else if (confirming) {
-				text = 'DELETE?'; sub = 'Click ✕ again to remove'; fill = null; clickable = false;
+				text = 'DELETE?'; sub = gamepad ? 'Press X again to remove' : 'Click ✕ again to remove'; fill = null; clickable = false;
 			} else if ((pending && state === 'downloading') || state === 'stopping') {
 				text = 'STOPPING…'; sub = `${install.percent}% · ${game.store}`; fill = install.percent; clickable = false;
 			} else if (state === 'downloading') {
@@ -145,13 +205,16 @@ export function pageScript() {
 			} else {
 				text = 'INSTALL'; sub = `via Heroic · ${game.store}`; fill = null; clickable = true;
 			}
+			if (gamepad && !pending && !button.dataset.removing && (state === 'downloading' || state === 'stopped') && !confirming) {
+				sub += state === 'downloading' ? ' · A pause · X remove' : ' · X remove';
+			}
 			if (label.textContent !== text) label.textContent = text;
 			if (detail.textContent !== sub) detail.textContent = sub;
 			button.style.cursor = clickable ? 'pointer' : 'default';
 			button.dataset.pendingFor = state === 'downloading' || state === 'stopping' ? 'stopped' : 'downloading';
 			const busy = pending || button.dataset.removing;
-			pause.style.display = state === 'downloading' && !busy ? 'flex' : 'none';
-			remove.style.display = (state === 'downloading' || state === 'stopped') && !busy ? 'flex' : 'none';
+			pause.style.display = state === 'downloading' && !busy && !gamepad ? 'flex' : 'none';
+			remove.style.display = (state === 'downloading' || state === 'stopped') && !busy && !gamepad ? 'flex' : 'none';
 			const shown = [pause, remove].filter((el) => el.style.display === 'flex').length;
 			button.style.paddingRight = `${16 + shown * 26}px`;
 			if (button.dataset.removing) button.dataset.pendingFor = '';
@@ -206,10 +269,34 @@ export function pageScript() {
 			}
 		}
 
+		function placeOverlay(doc, cls) {
+			const appid = openAppId();
+			const game = appid && games[appid];
+			for (const play of doc.querySelectorAll(`.${cls.play.PlayButtonContainer.split(' ')[0]}`)) {
+				let overlay = play.querySelector(`:scope > .${BUTTON_CLASS}`);
+				if (!game || game.installed) {
+					overlay?.remove();
+					continue;
+				}
+				if (overlay?.dataset.appid !== appid) {
+					overlay?.remove();
+					overlay = makeOverlay(doc, appid);
+					play.append(overlay);
+					if (getComputedStyle(play).position === 'static') play.style.position = 'relative';
+				}
+				renderButton(overlay, game);
+			}
+		}
+
 		function tick() {
-			const doc = mainDoc();
+			const { doc, gamepad } = mainWindow();
 			const cls = steamClasses();
 			if (!doc || !cls.play || !cls.row) return;
+			if (gamepad) {
+				hookGamepad(doc);
+				placeOverlay(doc, cls);
+				return;
+			}
 			placeButton(doc, cls);
 			greyRows(doc, cls);
 		}
