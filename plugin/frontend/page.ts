@@ -138,14 +138,12 @@ export function pageScript() {
 		}
 
 		// A (or a tap) on Play: install, pause a download, or resume. X: remove a started
-		// install, pressed twice like ✕ on the desktop. GOG keeps Steam's own Play: gamescope
-		// shows only windows of apps Steam launched, so Heroic's prompt must start that way.
+		// install, pressed twice like ✕ on the desktop.
 		const GAMEPAD_OK = 1, GAMEPAD_X = 3;
 		function onGamepadButton(event) {
 			const container = classes?.play.PlayButtonContainer.split(' ')[0];
 			const overlay = container && event.target?.closest?.(`.${container}`)?.querySelector(`:scope > .${BUTTON_CLASS}`);
 			if (!overlay) return;
-			if (games[overlay.dataset.appid]?.store !== 'Epic') return;
 			const state = games[overlay.dataset.appid]?.install?.state;
 			const x = event.type === 'vgp_onbuttondown' && event.detail?.button === GAMEPAD_X;
 			if (event.type === 'vgp_onbuttondown' && !x) return;
@@ -223,9 +221,7 @@ export function pageScript() {
 				: `linear-gradient(90deg, ${BLUE} ${fill}%, ${TRACK} ${fill}%)`;
 			button.title = install?.state === 'failed'
 				? `Install of ${game.title} failed. Log: ${install.log}`
-				: game.store === 'Epic'
-					? `${game.title} is not installed. Downloads it directly with Heroic's legendary.`
-					: `${game.title} is not installed. Opens Heroic's install dialog.`;
+				: `${game.title} is not installed. Downloads it directly with Heroic's ${game.store === 'Epic' ? 'legendary' : 'gogdl'}.`;
 		}
 
 		// The page has two Play buttons: under the banner, and in the sticky header that

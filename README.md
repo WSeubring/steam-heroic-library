@@ -14,8 +14,8 @@ library on Linux, looking and behaving like Steam games:
 - **Genre collections** in Steam for your Heroic *and* Steam games, from a list you curate,
   with [Jev](https://docs.typesafe.ai) (optional) sorting whatever the list does not cover.
 - **An Install button in Steam** (Millennium plugin): it replaces Play on games that are
-  not installed. Epic games download straight away with progress on the button, ⏸ to pause,
-  Resume, and ✕ to remove. Not-installed games show greyed out in the library list, like
+  not installed. Epic and GOG games download straight away with progress on the button,
+  ⏸ to pause, Resume, and ✕ to remove. Not-installed games show greyed out in the library list, like
   Steam's own.
 
 Everything syncs when Steam starts, so new purchases show up on the next launch. It works in
@@ -28,7 +28,7 @@ installed) has grey art, Jotunnslayer (Epic, installed) has full color:
 
 ![Recent games in Game Mode with Epic and GOG games](docs/screenshots/recent-games.png)
 
-An Epic game that is not installed: Install replaces Play and downloads it directly.
+A game that is not installed: Install replaces Play and downloads it directly.
 
 ![Install button on an Epic game page](docs/screenshots/epic-install.png)
 
@@ -36,18 +36,17 @@ Download progress on the button, then Resume after a pause:
 
 ![Installing and Resume states](docs/screenshots/epic-progress.png)
 
-A GOG game opens Heroic's install prompt:
+The same for a GOG game:
 
 ![Install button on a GOG game page](docs/screenshots/gog-install.png)
-![Heroic install prompt in Game Mode](docs/screenshots/gog-prompt.png)
 
 ## Requirements
 
 - Linux with native Steam (not Flatpak) at `/usr/bin/steam`
 - Heroic installed natively (not Flatpak) as `heroic` on `PATH` or `~/.local/bin/heroic`,
-  logged in to Epic and/or GOG. Its bundled legendary is found next to the resolved
-  binary (AUR `heroic-games-launcher-bin`, or the release `.tar.xz` unpacked anywhere);
-  set `HEROIC_BIN` and `HEROIC_LEGENDARY` to override
+  logged in to Epic and/or GOG. Its bundled legendary and gogdl are found next to the
+  resolved binary (AUR `heroic-games-launcher-bin`, or the release `.tar.xz` unpacked
+  anywhere); set `HEROIC_BIN`, `HEROIC_LEGENDARY` and `HEROIC_GOGDL` to override
 - Python 3.10+, ImageMagick (`magick`), `jq`, `notify-send`
 - For the Install button: [Millennium](https://steambrew.app) 3.4+ and [Bun](https://bun.com)
 - For Jev sorting (optional): a [TypeSafe](https://console.typesafe.ai/keys) API key
@@ -110,16 +109,16 @@ Run `heroic-steam-sync --classify` with Steam closed to sort everything at once.
 
 ## Installing from Steam
 
-- **Epic**: Install downloads directly with Heroic's bundled legendary into Heroic's default
-  install folder, so Heroic sees the game as installed afterwards. Progress is size on disk
-  over install size, so it stays right across pause and resume. ✕ asks for a second click,
-  then deletes the partial download.
-- **GOG**: Install opens Heroic's install prompt, because Heroic only registers GOG installs
-  it ran itself.
-- **Game Mode**: the install state is drawn over Steam's own Play button, so it keeps
-  controller focus. For Epic, A installs, pauses or resumes; X twice (within 4 seconds)
-  removes a started install. For GOG, A opens Heroic's install prompt through Steam's own
-  Play, because Game Mode only shows windows of apps Steam launched.
+Install downloads the Windows build directly with Heroic's bundled runner into Heroic's
+default install folder: legendary for Epic, gogdl for GOG. Heroic sees the game as
+installed afterwards; a finished GOG download is added to Heroic's GOG install list, and
+Heroic installs its redistributables on the first launch. Progress is size on disk over
+install size, so it stays right across pause and resume. ✕ asks for a second click, then
+deletes the partial download.
+
+In Game Mode the install state is drawn over Steam's own Play button, so it keeps
+controller focus. A installs, pauses or resumes; X twice (within 4 seconds) removes a
+started install.
 
 ## Notes
 

@@ -18,8 +18,8 @@ Usage:
 Used by the Steam plugin:
   heroic-steam-sync --list          JSON of every Heroic shortcut and its status
   heroic-steam-sync --status APPID  JSON install status of one shortcut
-  heroic-steam-sync --install APPID install it: Epic downloads directly with
-                                    Heroic's legendary, GOG opens Heroic's prompt
+  heroic-steam-sync --install APPID download it directly with Heroic's legendary
+                                    (Epic) or gogdl (GOG)
   heroic-steam-sync --stop APPID    pause a direct install (resumable)
   heroic-steam-sync --remove APPID  cancel a direct install, delete its partial files
 """
@@ -48,13 +48,22 @@ LAUNCH_EXE = f'"{HOME}/.local/bin/heroic-steam-launch"'
 # Collections this script owns; any of these not written by the current sync get deleted.
 MANAGED_COLLECTIONS = ("user-collections.uc-hss-", "user-collections.uc-heroicepic")
 CATEGORIES = HOME / ".config/heroic-steam-sync/categories.json"
-LEGENDARY_REL = "resources/app.asar.unpacked/build/bin/x64/linux/legendary"
-LEGENDARY = os.environ.get("HEROIC_LEGENDARY") or next(
-    (str(p) for p in (Path(exe).resolve().parent / LEGENDARY_REL
-                      for exe in (shutil.which("heroic"), HOME / ".local/bin/heroic",
-                                  "/opt/Heroic/heroic") if exe)
-     if p.exists()),
-    f"/opt/Heroic/{LEGENDARY_REL}")
+HEROIC_TOOLS = "resources/app.asar.unpacked/build/bin/x64/linux"
+
+
+def heroic_tool(name):
+    """A runner bundled with Heroic (legendary, gogdl), next to the resolved heroic binary."""
+    return next(
+        (str(p) for p in (Path(exe).resolve().parent / HEROIC_TOOLS / name
+                          for exe in (shutil.which("heroic"), HOME / ".local/bin/heroic",
+                                      "/opt/Heroic/heroic") if exe)
+         if p.exists()),
+        f"/opt/Heroic/{HEROIC_TOOLS}/{name}")
+
+
+LEGENDARY = os.environ.get("HEROIC_LEGENDARY") or heroic_tool("legendary")
+GOGDL = os.environ.get("HEROIC_GOGDL") or heroic_tool("gogdl")
+GOGDL_CONFIG = HEROIC / "gogdlConfig"
 INSTALLS = HOME / ".cache/heroic-steam-sync/installs"
 STEAM = HOME / ".local/share/Steam"
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
@@ -579,20 +588,21 @@ def install_percent(log):
         if out.returncode == 0:
             done = int(out.stdout.split()[0])
             return min(99.9, round(done / (float(size.group(1)) * 1024 * 1024) * 100, 1))
-    percents = re.findall(r"Progress: ([\d.]+)%", data[-20000:].decode(errors="replace"))
+    percents = re.findall(r"Progress: ([\d.]+)", data[-20000:].decode(errors="replace"))
     return float(percents[-1]) if percents else 0.0
 
 
 def install_state(game):
-    """Progress of a direct Epic install started by install(), or None."""
-    if game["runner"] != "legendary" or game["installed"]:
+    """Progress of a direct install started by install(), or None."""
+    if game["installed"]:
         return None
     log, pid = INSTALLS / f"{game['app_name']}.log", INSTALLS / f"{game['app_name']}.pid"
     if not log.exists():
         return None
     percent = install_percent(log)
+    tool = Path(LEGENDARY if game["runner"] == "legendary" else GOGDL).name
     try:
-        running = "legendary" in Path(f"/proc/{int(pid.read_text())}/cmdline").read_text(errors="replace")
+        running = tool in Path(f"/proc/{int(pid.read_text())}/cmdline").read_text(errors="replace")
     except (OSError, ValueError):
         running = False
     if (INSTALLS / f"{game['app_name']}.stopped").exists():
@@ -611,42 +621,100 @@ def list_games(_=None):
             for g, name in zip(games, steam_names(games))}
 
 
+def install_base():
+    """Heroic's default install folder."""
+    return json.loads((HEROIC / "config.json").read_text())["defaultSettings"].get(
+        "defaultInstallPath", str(HOME / "Games/Heroic"))
+
+
+def gog_info(app):
+    """gogdl's Windows build info for a GOG game, plus the language to install."""
+    out = subprocess.run(
+        [GOGDL, "--auth-config-path", str(HEROIC / "gog_store/auth.json"), "info", app, "--os", "windows"],
+        env={**os.environ, "GOGDL_CONFIG_PATH": str(GOGDL_CONFIG)},
+        capture_output=True, text=True, timeout=60, check=True)
+    info = json.loads(out.stdout)
+    langs = [lang for lang in info["size"] if lang != "*"]
+    info["language"] = "en-US" if "en-US" in langs else langs[0]
+    return info
+
+
+def gog_register(app):
+    """Add a finished gogdl download to Heroic's GOG install list, as Heroic's own install does.
+
+    Heroic runs the game's setup (redistributables) itself on the first launch.
+    """
+    info = json.loads((INSTALLS / f"{app}.gog.json").read_text())
+    path = Path(install_base()) / info["folder_name"]
+    size = int(subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True,
+                              check=True).stdout.split()[0])
+    store = HEROIC / "gog_store/installed.json"
+    data = json.loads(store.read_text()) if store.exists() else {}
+    data["installed"] = [g for g in data.get("installed", []) if g.get("appName") != app] + [{
+        "platform": "windows", "executable": "", "install_path": str(path),
+        "install_size": f"{size / 1024 ** 3:.2f} GiB" if size >= 1024 ** 3 else f"{size / 1024 ** 2:.2f} MiB",
+        "is_dlc": False, "version": info.get("versionName"), "appName": app, "installedDLCs": [],
+        "language": info["language"], "versionEtag": info.get("versionEtag", ""),
+        "buildId": info.get("buildId", ""), "pinnedVersion": False,
+    }]
+    tmp = store.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(store)
+    return {"ok": True, "install_path": str(path)}
+
+
 def install(appid):
     """Install the game behind a Steam shortcut.
 
-    Epic: download directly with Heroic's bundled legendary and Heroic's config, so
-    Heroic sees the game as installed afterwards. GOG: Heroic only registers GOG
-    installs it ran itself, so open Heroic's install prompt instead.
+    Downloads directly with Heroic's bundled runner and Heroic's config into Heroic's
+    default install folder, so Heroic sees the game as installed afterwards: legendary
+    for Epic, gogdl for GOG (then registered in Heroic's GOG install list).
     """
     found = find_game(appid)
     if not found:
         return {"ok": False, "error": "not a Heroic game"}
     game, name = found
+    app = game["app_name"]
     quiet = {"start_new_session": True, "stdin": subprocess.DEVNULL}
-    if game["runner"] != "legendary":
-        subprocess.Popen([LAUNCH_EXE.strip('"'), game["runner"], game["app_name"], name],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **quiet)
-        return {"ok": True, "mode": "heroic"}
     state = (install_state(game) or {}).get("state")
     if state == "downloading":
         return {"ok": True, "mode": "direct", "already": True}
     if state == "stopping":
         return {"ok": False, "error": "still stopping, try again in a few seconds"}
     INSTALLS.mkdir(parents=True, exist_ok=True)
-    (INSTALLS / f"{game['app_name']}.stopped").unlink(missing_ok=True)
-    log = INSTALLS / f"{game['app_name']}.log"
-    script = (
-        'LEGENDARY_CONFIG_PATH="$HOME/.config/heroic/legendaryConfig/legendary" '
-        '"$1" -y install "$2" --base-path "$3" --platform Windows --skip-sdl --skip-dlcs '
-        '&& notify-send -a Heroic "Installed: $4" "Ready to play from Steam." '
-        '|| [ -e "$6" ] || notify-send -u critical -a Heroic "Install failed: $4" "Log: $5"'
-    )
-    base = json.loads((HEROIC / "config.json").read_text())["defaultSettings"].get(
-        "defaultInstallPath", str(HOME / "Games/Heroic"))
+    (INSTALLS / f"{app}.stopped").unlink(missing_ok=True)
+    log = INSTALLS / f"{app}.log"
+    base = install_base()
+    done = ('&& notify-send -a Heroic "Installed: $4" "Ready to play from Steam." '
+            '|| [ -e "$6" ] || notify-send -u critical -a Heroic "Install failed: $4" "Log: $5"')
+    if game["runner"] == "legendary":
+        tool, header = LEGENDARY, ""
+        script = (
+            'LEGENDARY_CONFIG_PATH="$HOME/.config/heroic/legendaryConfig/legendary" '
+            '"$1" -y install "$2" --base-path "$3" --platform Windows --skip-sdl --skip-dlcs '
+            + done)
+    else:
+        try:
+            info = gog_info(app)
+        except (subprocess.SubprocessError, ValueError, KeyError) as e:
+            return {"ok": False, "error": f"gogdl info failed: {e}"}
+        (INSTALLS / f"{app}.gog.json").write_text(json.dumps(info))
+        size = info["size"].get("*", {}).get("disk_size", 0) + info["size"][info["language"]]["disk_size"]
+        tool = GOGDL
+        header = (f"Install path: {Path(base) / info['folder_name']}\n"
+                  f"Install size: {size / 1024 / 1024:.2f} MiB\n")
+        script = (
+            f'GOGDL_CONFIG_PATH={shlex.quote(str(GOGDL_CONFIG))} '
+            f'"$1" --auth-config-path {shlex.quote(str(HEROIC / "gog_store/auth.json"))} '
+            'download "$2" --platform windows --path "$3" '
+            f'--support {shlex.quote(str(GOGDL_CONFIG / "heroic_gogdl/gog-support" / app))} '
+            f'--skip-dlcs --lang {shlex.quote(info["language"])} '
+            f'&& {shlex.quote(str(Path(__file__).resolve()))} --gog-register "$2" ' + done)
     with open(log, "w") as out:
-        proc = subprocess.Popen(["bash", "-c", script, "legendary-install", LEGENDARY,
-                                 game["app_name"], base, name, str(log),
-                                 str(INSTALLS / f"{game['app_name']}.stopped")],
+        out.write(header)
+        out.flush()
+        proc = subprocess.Popen(["bash", "-c", script, f"{game['runner']}-install", tool,
+                                 app, base, name, str(log), str(INSTALLS / f"{app}.stopped")],
                                 stdout=out, stderr=subprocess.STDOUT, **quiet)
     (INSTALLS / f"{game['app_name']}.pid").write_text(str(proc.pid))
     subprocess.Popen(["notify-send", "-a", "Heroic", f"Installing: {name}",
@@ -655,7 +723,7 @@ def install(appid):
 
 
 def stop(appid):
-    """Stop a direct Epic install; legendary resumes it on the next install()."""
+    """Stop a direct install; legendary or gogdl resumes it on the next install()."""
     found = find_game(appid)
     if not found:
         return {"ok": False, "error": "not a Heroic game"}
@@ -674,9 +742,9 @@ def stop(appid):
 
 
 def remove(appid):
-    """Cancel a direct Epic install: stop it if running, delete its partial files.
+    """Cancel a direct install: stop it if running, delete its partial files.
 
-    Deletes only the install folder legendary logged for this game, and only when it
+    Deletes only the install folder logged for this game, and only when it
     sits inside Heroic's install folder and the game is not installed.
     """
     found = find_game(appid)
@@ -684,7 +752,7 @@ def remove(appid):
         return {"ok": False, "error": "not a Heroic game"}
     game, _ = found
     app = game["app_name"]
-    if game["runner"] != "legendary" or game["installed"]:
+    if game["installed"]:
         return {"ok": False, "error": "nothing to remove"}
     log, pid_file = INSTALLS / f"{app}.log", INSTALLS / f"{app}.pid"
     if not log.exists():
@@ -700,8 +768,7 @@ def remove(appid):
         time.sleep(0.5)
     except (OSError, ValueError):
         pass  # not running (anymore)
-    base = Path(json.loads((HEROIC / "config.json").read_text())["defaultSettings"].get(
-        "defaultInstallPath", str(HOME / "Games/Heroic"))).resolve()
+    base = Path(install_base()).resolve()
     path = re.search(r"Install path: (.+)", log.read_bytes()[:50000].decode(errors="replace"))
     removed = None
     if path:
@@ -710,7 +777,9 @@ def remove(appid):
             shutil.rmtree(target)
             removed = str(target)
     (HEROIC / f"legendaryConfig/legendary/tmp/{app}.resume").unlink(missing_ok=True)
-    for suffix in ("log", "pid", "stopped"):
+    if game["runner"] == "gog":
+        shutil.rmtree(GOGDL_CONFIG / "heroic_gogdl/gog-support" / app, ignore_errors=True)
+    for suffix in ("log", "pid", "stopped", "gog.json"):
         (INSTALLS / f"{app}.{suffix}").unlink(missing_ok=True)
     return {"ok": True, "removed": removed}
 
@@ -718,6 +787,9 @@ def remove(appid):
 def main():
     if "--list" in sys.argv:
         print(json.dumps(list_games()))
+        return
+    if "--gog-register" in sys.argv:
+        print(json.dumps(gog_register(sys.argv[sys.argv.index("--gog-register") + 1])))
         return
     for flag, action in (("--status", status), ("--install", install), ("--stop", stop),
                          ("--remove", remove)):
