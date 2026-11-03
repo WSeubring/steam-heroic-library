@@ -639,6 +639,29 @@ def gog_info(app):
     return info
 
 
+def free_gogdl_shm():
+    """Delete shared memory that killed gogdl downloads left behind.
+
+    gogdl keeps a 2 GiB buffer in /dev/shm per download and does not free it when it is
+    killed. A few of them fill /dev/shm, and then Steam and gamescope crash with SIGBUS.
+    """
+    mapped = set()
+    for maps in Path("/proc").glob("[0-9]*/maps"):
+        try:
+            mapped.update(re.findall(r"/dev/shm/psm_\w+", maps.read_text(errors="replace")))
+        except OSError:
+            pass
+    freed = []
+    for seg in Path("/dev/shm").glob("psm_*"):
+        try:
+            if seg.stat().st_uid == os.getuid() and str(seg) not in mapped:
+                seg.unlink()
+                freed.append(seg.name)
+        except OSError:
+            pass
+    return {"ok": True, "freed": freed}
+
+
 def gog_register(app):
     """Add a finished gogdl download to Heroic's GOG install list, as Heroic's own install does.
 
@@ -699,6 +722,7 @@ def install(appid):
         except (subprocess.SubprocessError, ValueError, KeyError) as e:
             return {"ok": False, "error": f"gogdl info failed: {e}"}
         (INSTALLS / f"{app}.gog.json").write_text(json.dumps(info))
+        free_gogdl_shm()
         size = info["size"].get("*", {}).get("disk_size", 0) + info["size"][info["language"]]["disk_size"]
         tool = GOGDL
         header = (f"Install path: {Path(base) / info['folder_name']}\n"
@@ -735,7 +759,8 @@ def stop(appid):
     # The install runs in its own session (process group = pid): ask bash and legendary
     # to stop, then force it if legendary is still shutting down after 5 seconds.
     os.killpg(pid, signal.SIGTERM)
-    subprocess.Popen(["sh", "-c", f"sleep 5; kill -KILL -- -{pid} 2>/dev/null"],
+    subprocess.Popen(["sh", "-c", f'sleep 5; kill -KILL -- -{pid} 2>/dev/null; sleep 1; '
+                      f'{shlex.quote(str(Path(__file__).resolve()))} --free-shm >/dev/null'],
                      start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"ok": True}
@@ -778,6 +803,7 @@ def remove(appid):
             removed = str(target)
     (HEROIC / f"legendaryConfig/legendary/tmp/{app}.resume").unlink(missing_ok=True)
     if game["runner"] == "gog":
+        free_gogdl_shm()
         shutil.rmtree(GOGDL_CONFIG / "heroic_gogdl/gog-support" / app, ignore_errors=True)
     for suffix in ("log", "pid", "stopped", "gog.json"):
         (INSTALLS / f"{app}.{suffix}").unlink(missing_ok=True)
@@ -787,6 +813,9 @@ def remove(appid):
 def main():
     if "--list" in sys.argv:
         print(json.dumps(list_games()))
+        return
+    if "--free-shm" in sys.argv:
+        print(json.dumps(free_gogdl_shm()))
         return
     if "--gog-register" in sys.argv:
         print(json.dumps(gog_register(sys.argv[sys.argv.index("--gog-register") + 1])))
