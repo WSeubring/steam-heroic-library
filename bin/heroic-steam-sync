@@ -472,7 +472,7 @@ def owned_games():
             installed = read_installed()
         except FileNotFoundError:
             installed = set()
-        for g in json.loads(path.read_text())[key]:
+        for g in json.loads(path.read_text()).get(key, []):
             if (g.get("install") or {}).get("is_dlc") or g["app_name"].endswith("-redist"):
                 continue
             games.append({**g, "runner": runner, "installed": g["app_name"] in installed})
