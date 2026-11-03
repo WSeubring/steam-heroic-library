@@ -18,15 +18,36 @@ library on Linux, looking and behaving like Steam games:
   Resume, and ✕ to remove. Not-installed games show greyed out in the library list, like
   Steam's own.
 
-Everything syncs when Steam starts, so new purchases show up on the next launch.
+Everything syncs when Steam starts, so new purchases show up on the next launch. It works in
+the desktop client and in Game Mode (Bazzite, gamescope-session).
+
+## Screenshots
+
+Game Mode on Bazzite. Epic and GOG games sit next to Steam games; Cyberpunk 2077 (GOG, not
+installed) has grey art, Jotunnslayer (Epic, installed) has full color:
+
+![Recent games in Game Mode with Epic and GOG games](docs/screenshots/recent-games.png)
+
+An Epic game that is not installed: Install replaces Play and downloads it directly.
+
+![Install button on an Epic game page](docs/screenshots/epic-install.png)
+
+Download progress on the button, then Resume after a pause:
+
+![Installing and Resume states](docs/screenshots/epic-progress.png)
+
+A GOG game opens Heroic's install prompt:
+
+![Install button on a GOG game page](docs/screenshots/gog-install.png)
+![Heroic install prompt in Game Mode](docs/screenshots/gog-prompt.png)
 
 ## Requirements
 
 - Linux with native Steam (not Flatpak) at `/usr/bin/steam`
-- Heroic installed natively, with its bundled legendary at
-  `/opt/Heroic/resources/app.asar.unpacked/build/bin/x64/linux/legendary`
-  (AUR `heroic-games-launcher-bin`; set `HEROIC_LEGENDARY` for another path), logged in to
-  Epic and/or GOG
+- Heroic installed natively (not Flatpak) as `heroic` on `PATH` or `~/.local/bin/heroic`,
+  logged in to Epic and/or GOG. Its bundled legendary is found next to the resolved
+  binary (AUR `heroic-games-launcher-bin`, or the release `.tar.xz` unpacked anywhere);
+  set `HEROIC_BIN` and `HEROIC_LEGENDARY` to override
 - Python 3.10+, ImageMagick (`magick`), `jq`, `notify-send`
 - For the Install button: [Millennium](https://steambrew.app) 3.4+ and [Bun](https://bun.com)
 - For Jev sorting (optional): a [TypeSafe](https://console.typesafe.ai/keys) API key
@@ -44,6 +65,23 @@ first, creates `~/.config/heroic-steam-sync/categories.json` from the example, a
 the plugin when Bun and Millennium are present. Then enable **Heroic Install** in
 Steam → Millennium → Plugins and fully quit and restart Steam.
 
+### Bazzite (and other image-based systems)
+
+`/usr` and `/opt` are read-only, so install everything in your home directory:
+
+- **Heroic**: unpack the release `Heroic-*-linux-x64.tar.xz` to `~/.local/opt/Heroic` and
+  link `~/.local/bin/heroic` to `~/.local/opt/Heroic/heroic`.
+- **Millennium**: unpack the release tarball's `usr/lib/millennium` to
+  `~/.local/lib/millennium`, set
+  `MILLENNIUM_RUNTIME_PATH=${HOME}/.local/lib/millennium/libmillennium_x86.so` in
+  `~/.config/environment.d/millennium.conf`, and create the three symlinks the official
+  installer makes in `~/.local/share/Steam/ubuntu12_32` and `ubuntu12_64`, pointing into
+  `~/.local/lib/millennium`.
+
+`install.sh` also hooks Game Mode: it writes
+`~/.config/gamescope-session-plus/sessions.d/steam` and `ogui-steam`, so the session runs the sync before it
+starts Steam. Desktop mode keeps Bazzite's `bazzite-steam` wrapper (`$HEROIC_STEAM`).
+
 ## How it works
 
 | Piece | What it does |
@@ -52,6 +90,7 @@ Steam → Millennium → Plugins and fully quit and restart Steam.
 | `bin/heroic-steam-launch` | Target of every shortcut: installed games launch through Heroic, others open Heroic's install prompt. |
 | `plugin/` | Millennium plugin: the Install button, progress and the greyed-out list rows. |
 | `~/.local/share/applications/steam.desktop` | Override that runs `heroic-steam-sync --launch-steam` instead of plain Steam. |
+| `~/.config/gamescope-session-plus/sessions.d/{steam,ogui-steam}` | Same for Game Mode (gamescope-session-plus, as on Bazzite). |
 
 The sync only touches shortcuts it created and collections whose id starts with `uc-hss-`;
 your other shortcuts and collections stay as they are.
@@ -77,6 +116,10 @@ Run `heroic-steam-sync --classify` with Steam closed to sort everything at once.
   then deletes the partial download.
 - **GOG**: Install opens Heroic's install prompt, because Heroic only registers GOG installs
   it ran itself.
+- **Game Mode**: the install state is drawn over Steam's own Play button, so it keeps
+  controller focus. For Epic, A installs, pauses or resumes; X twice (within 4 seconds)
+  removes a started install. For GOG, A opens Heroic's install prompt through Steam's own
+  Play, because Game Mode only shows windows of apps Steam launched.
 
 ## Notes
 
