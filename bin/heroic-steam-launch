@@ -8,12 +8,13 @@ app="$2"
 title="${3:-$2}"
 url="heroic://launch?appName=${app}&runner=${runner}"
 heroic=~/.config/heroic
+heroic_bin=${HEROIC_BIN:-$(command -v heroic || echo ~/.local/bin/heroic)}
 
 case $runner in
   legendary) jq -e --arg a "$app" 'has($a)' "$heroic/legendaryConfig/legendary/installed.json" ;;
   gog) jq -e --arg a "$app" 'any(.installed[]; .appName == $a)' "$heroic/gog_store/installed.json" ;;
   *) false ;;
-esac >/dev/null 2>&1 && exec /usr/bin/heroic --no-gui --no-sandbox "$url"
+esac >/dev/null 2>&1 && exec "$heroic_bin" --no-gui --no-sandbox "$url"
 
 notify-send -a Heroic "Not installed: $title" "Opening Heroic to install it. Steam picks up the new status next time it starts."
-exec /usr/bin/heroic --no-sandbox "$url"
+exec "$heroic_bin" --no-sandbox "$url"

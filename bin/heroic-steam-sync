@@ -10,7 +10,8 @@ Steam collections from ~/.config/heroic-steam-sync/categories.json, with Jev
 Usage:
   heroic-steam-sync                 sync now (skips if Steam is running)
   heroic-steam-sync --launch-steam  sort new games, sync, then start Steam
-                                    (desktop entry; never prompts for a key)
+                                    ($HEROIC_STEAM, default /usr/bin/steam;
+                                    desktop entry; never prompts for a key)
   heroic-steam-sync --classify      sort new games with Jev, then sync
                                     (key: $TYPESAFE_API_KEY, or rbw item $JEV_SECRET)
 
@@ -47,8 +48,13 @@ LAUNCH_EXE = f'"{HOME}/.local/bin/heroic-steam-launch"'
 # Collections this script owns; any of these not written by the current sync get deleted.
 MANAGED_COLLECTIONS = ("user-collections.uc-hss-", "user-collections.uc-heroicepic")
 CATEGORIES = HOME / ".config/heroic-steam-sync/categories.json"
-LEGENDARY = os.environ.get(
-    "HEROIC_LEGENDARY", "/opt/Heroic/resources/app.asar.unpacked/build/bin/x64/linux/legendary")
+LEGENDARY_REL = "resources/app.asar.unpacked/build/bin/x64/linux/legendary"
+LEGENDARY = os.environ.get("HEROIC_LEGENDARY") or next(
+    (str(p) for p in (Path(exe).resolve().parent / LEGENDARY_REL
+                      for exe in (shutil.which("heroic"), HOME / ".local/bin/heroic",
+                                  "/opt/Heroic/heroic") if exe)
+     if p.exists()),
+    f"/opt/Heroic/{LEGENDARY_REL}")
 INSTALLS = HOME / ".cache/heroic-steam-sync/installs"
 STEAM = HOME / ".local/share/Steam"
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
@@ -727,7 +733,8 @@ def main():
             raise
     if "--launch-steam" in sys.argv:
         args = [a for a in sys.argv[1:] if a != "--launch-steam"]
-        os.execv("/usr/bin/steam", ["/usr/bin/steam", *args])
+        steam = os.environ.get("HEROIC_STEAM", "/usr/bin/steam")
+        os.execv(steam, [steam, *args])
 
 
 if __name__ == "__main__":
